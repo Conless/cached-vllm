@@ -184,6 +184,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   )
   FetchContent_MakeAvailable(cutlass)
 
+  FetchContent_Declare(
+        flashinfer
+        GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git 
+        GIT_TAG main
+  )
+  FetchContent_MakeAvailable(flashinfer)
+  
+  set(FLASHINFER_INCLUDE_DIR ${flashinfer_SOURCE_DIR}/include)
+
   list(APPEND VLLM_EXT_SRC
     "csrc/quantization/aqlm/gemm_kernels.cu"
     "csrc/quantization/awq/gemm_kernels.cu"
@@ -246,6 +255,8 @@ set(VLLM_PUNICA_EXT_SRC
   "csrc/punica/bgmv/bgmv_fp16_fp32_fp16.cu"
   "csrc/punica/bgmv/bgmv_fp32_bf16_bf16.cu"
   "csrc/punica/bgmv/bgmv_fp32_fp16_fp16.cu"
+  "csrc/punica/sgmv/sgmv_cutlass.cu"
+  "csrc/punica/sgmv_flashinfer/sgmv_all.cu"
   "csrc/punica/punica_ops.cu"
   "csrc/punica/punica_pybind.cpp")
 
@@ -283,6 +294,7 @@ if (VLLM_PUNICA_GPU_ARCHES)
     LANGUAGE ${VLLM_GPU_LANG}
     SOURCES ${VLLM_PUNICA_EXT_SRC}
     COMPILE_FLAGS ${VLLM_PUNICA_GPU_FLAGS}
+    INCLUDE_DIRECTORIES ${FLASHINFER_INCLUDE_DIR};${CUTLASS_INCLUDE_DIR};${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
     ARCHITECTURES ${VLLM_PUNICA_GPU_ARCHES}
     WITH_SOABI)
 else()
