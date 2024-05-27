@@ -187,7 +187,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   FetchContent_Declare(
         flashinfer
         GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git 
-        GIT_TAG main
+        GIT_TAG 7e9cc7ff42ca283c317061a877305d09a395fad2
   )
   FetchContent_MakeAvailable(flashinfer)
   
