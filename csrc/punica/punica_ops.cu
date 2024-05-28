@@ -1,6 +1,8 @@
+#include <c10/core/ScalarType.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
+#include <type_traits>
 
 #include "type_convert.h"
 #include "../cuda_compat.h"
@@ -619,8 +621,27 @@ void dispatch_sgmv_cutlass(torch::Tensor y, torch::Tensor x,
   int d_out = y.size(1);
   CHECK_EQ(tmp.size(0), static_cast<int64_t>(sgmv_tmp_size(num_problems)));
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  // The following two special handling is for data types in vLLM.
+  // The first is tmp = tmp + x * A, and tmp is in float.
+  if (y.scalar_type() == at::ScalarType::Float &&
+      x.scalar_type() == at::ScalarType::Half) {
+    sgmv<float, half, half>((float *)y.data_ptr(), (half *)x.data_ptr(),
+                            (half **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                            layer_idx, stream);
+    return;
+  }
+  // The second is y = y + tmp * B.
+  if (y.scalar_type() == at::ScalarType::Half &&
+      x.scalar_type() == at::ScalarType::Float) {
+    sgmv<half, float, half>((half *)y.data_ptr(), (float *)x.data_ptr(),
+                            (half **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                            layer_idx, stream);
+    return;
+  }
   bool ok = DISPATCH_TORCH_DTYPE(x.scalar_type(), [&] {
-    return sgmv<c_type>((c_type*)y.data_ptr(), (c_type*)x.data_ptr(),
+    return sgmv<c_type, c_type, c_type>((c_type*)y.data_ptr(), (c_type*)x.data_ptr(),
                         (c_type**)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
                         tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
                         layer_idx, stream);

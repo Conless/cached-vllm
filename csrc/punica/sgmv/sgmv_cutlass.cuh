@@ -18,6 +18,11 @@ struct cutlass_dtype {
 };
 
 template <>
+struct cutlass_dtype<float> {
+  using type = float;
+};
+
+template <>
 struct cutlass_dtype<half> {
   using type = cutlass::half_t;
 };
@@ -58,15 +63,21 @@ inline T *alloc_from_buf(void **buf, int n) {
   return p;
 }
 
-template <typename DType>
-bool sgmv(DType *y, DType *x, DType **w, int32_t *s, void *tmp_d,
+// In Punica, YShape, XShape and WShape are required to be all the same.
+// However, the precision would be sacrificed in LoRA computation,
+// where we wanna use float32 for intermediate results.
+// So we make a modification here to allow different precisions.
+template <typename YShape, typename XShape, typename WShape>
+bool sgmv(YShape *y, XShape *x, WShape **w, int32_t *s, void *tmp_d,
           int num_problems, int d_in, int d_out, int layer_idx,
           cudaStream_t stream) {
-  using cutlass_t = typename cutlass_dtype<DType>::type;
+  using cutlass_y_t = typename cutlass_dtype<YShape>::type;
+  using cutlass_x_t = typename cutlass_dtype<XShape>::type;
+  using cutlass_w_t = typename cutlass_dtype<WShape>::type;
 
-  auto ptr_Y = alloc_from_buf<cutlass_t *>(&tmp_d, num_problems);
-  auto ptr_X = alloc_from_buf<cutlass_t *>(&tmp_d, num_problems);
-  auto ptr_W = alloc_from_buf<cutlass_t *>(&tmp_d, num_problems);
+  auto ptr_Y = alloc_from_buf<cutlass_y_t *>(&tmp_d, num_problems);
+  auto ptr_X = alloc_from_buf<cutlass_x_t *>(&tmp_d, num_problems);
+  auto ptr_W = alloc_from_buf<cutlass_w_t *>(&tmp_d, num_problems);
   auto ld_Y = alloc_from_buf<int64_t>(&tmp_d, num_problems);
   auto ld_X = alloc_from_buf<int64_t>(&tmp_d, num_problems);
   auto ld_W = alloc_from_buf<int64_t>(&tmp_d, num_problems);
@@ -74,23 +85,23 @@ bool sgmv(DType *y, DType *x, DType **w, int32_t *s, void *tmp_d,
       alloc_from_buf<cutlass::gemm::GemmCoord>(&tmp_d, num_problems);
 
   precompute_sgmv_args<<<num_problems, 1, 0, stream>>>(
-      all_problems, ptr_Y, ptr_X, ptr_W, ld_Y, ld_X, ld_W, (cutlass_t *)y,
-      (cutlass_t *)x, (cutlass_t **)w, s, d_in, d_out, layer_idx);
+      all_problems, ptr_Y, ptr_X, ptr_W, ld_Y, ld_X, ld_W, (cutlass_y_t *)y,
+      (cutlass_x_t *)x, (cutlass_w_t **)w, s, d_in, d_out, layer_idx);
 
   using cutlass::epilogue::thread::LinearCombination;
   using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
   if (d_in < d_out) {
     // Expand
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-        cutlass_t,                                      // Element A
+        cutlass_x_t,                                    // Element A
         cutlass::layout::RowMajor,                      // Layout A
         cutlass::ComplexTransform::kNone,               //
         8,                                              // Granularity A
-        cutlass_t,                                      // Element B
+        cutlass_w_t,                                    // Element B
         cutlass::layout::RowMajor,                      // Layout B
         cutlass::ComplexTransform::kNone,               //
         8,                                              // Granularity B
-        cutlass_t,                                      // Element C&D
+        cutlass_y_t,                                    // Element C&D
         cutlass::layout::RowMajor,                      // Layout C&D
         float,                                          // Element Accumulator
         cutlass::arch::OpClassTensorOp,                 // Operator Class Tag
@@ -98,7 +109,7 @@ bool sgmv(DType *y, DType *x, DType **w, int32_t *s, void *tmp_d,
         cutlass::gemm::GemmShape<32, 128, 16>,          // Thread Block Shape
         cutlass::gemm::GemmShape<32, 64, 16>,           // Warp Shape
         cutlass::gemm::GemmShape<16, 8, 8>,             // Instruction Shape
-        LinearCombination<cutlass_t, 8, float, float>,  // Epilogue
+        LinearCombination<cutlass_y_t, 8, float, float>,// Epilogue
         GemmIdentityThreadblockSwizzle<1>,              // Swizzling Operator
         2                                               // Stages
         >::GemmKernel;
@@ -127,15 +138,15 @@ bool sgmv(DType *y, DType *x, DType **w, int32_t *s, void *tmp_d,
   } else {
     // Shrink
     using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-        cutlass_t,                                      // Element A
+        cutlass_x_t,                                    // Element A
         cutlass::layout::RowMajor,                      // Layout A
         cutlass::ComplexTransform::kNone,               //
         8,                                              // Granularity A
-        cutlass_t,                                      // Element B
+        cutlass_w_t,                                    // Element B
         cutlass::layout::RowMajor,                      // Layout B
         cutlass::ComplexTransform::kNone,               //
         8,                                              // Granularity B
-        cutlass_t,                                      // Element C&D
+        cutlass_y_t,                                      // Element C&D
         cutlass::layout::RowMajor,                      // Layout C&D
         float,                                          // Element Accumulator
         cutlass::arch::OpClassTensorOp,                 // Operator Class Tag
@@ -143,7 +154,7 @@ bool sgmv(DType *y, DType *x, DType **w, int32_t *s, void *tmp_d,
         cutlass::gemm::GemmShape<16, 64, 64>,           // Thread Block Shape
         cutlass::gemm::GemmShape<16, 16, 64>,           // Warp Shape
         cutlass::gemm::GemmShape<16, 8, 16>,            // Instruction Shape
-        LinearCombination<cutlass_t, 4, float, float>,  // Epilogue
+        LinearCombination<cutlass_y_t, 4, float, float>,  // Epilogue
         GemmIdentityThreadblockSwizzle<2>,              // Swizzling Operator
         2                                               // Stages
         >::GemmKernel;
