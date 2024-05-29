@@ -74,3 +74,4 @@ bool sgmv_shrink(T* y, T* x, T** w, int32_t* s, void* tmp,
 
 FOR_SGMV_NARROW(INST, nv_half);
 FOR_SGMV_NARROW(INST, nv_bfloat16);
+FOR_SGMV_NARROW(INST, float);

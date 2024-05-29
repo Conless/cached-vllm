@@ -14,6 +14,10 @@ void dispatch_sgmv_cutlass(torch::Tensor y, torch::Tensor x,
                            torch::Tensor w_ptr, torch::Tensor s,
                            torch::Tensor tmp, int layer_idx);
 
+void dispatch_sgmv_cutlass_custom(torch::Tensor y, torch::Tensor x,
+                           torch::Tensor w_ptr, torch::Tensor s,
+                           torch::Tensor tmp, int layer_idx);
+
 void dispatch_sgmv_shrink(torch::Tensor y, torch::Tensor x, torch::Tensor w_ptr,
                           torch::Tensor s, torch::Tensor tmp, int layer_idx);
 

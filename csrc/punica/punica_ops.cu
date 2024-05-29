@@ -2,7 +2,6 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
-#include <type_traits>
 
 #include "type_convert.h"
 #include "../cuda_compat.h"
@@ -64,9 +63,10 @@ inline constexpr uint64_t pack_u32(uint32_t a, uint32_t b) {
     return __VA_ARGS__();                             \
   }
 
-#define _DISPATCH_DTYPE_CASES(...)                                 \
-  _DISPATCH_DTYPE_CASE(at::ScalarType::Half, nv_half, __VA_ARGS__) \
-  _DISPATCH_DTYPE_CASE(at::ScalarType::BFloat16, nv_bfloat16, __VA_ARGS__)
+#define _DISPATCH_DTYPE_CASES(...)                                         \
+  _DISPATCH_DTYPE_CASE(at::ScalarType::Half, nv_half, __VA_ARGS__)         \
+  _DISPATCH_DTYPE_CASE(at::ScalarType::BFloat16, nv_bfloat16, __VA_ARGS__) \
+  _DISPATCH_DTYPE_CASE(at::ScalarType::Float, float, __VA_ARGS__)
 
 #define DISPATCH_TORCH_DTYPE(scalar_type, ...) \
   _DISPATCH_SWITCH(scalar_type, _DISPATCH_DTYPE_CASES(__VA_ARGS__))
@@ -621,33 +621,111 @@ void dispatch_sgmv_cutlass(torch::Tensor y, torch::Tensor x,
   int d_out = y.size(1);
   CHECK_EQ(tmp.size(0), static_cast<int64_t>(sgmv_tmp_size(num_problems)));
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
-  // The following two special handling is for data types in vLLM.
-  // The first is tmp = tmp + x * A, and tmp is in float.
-  if (y.scalar_type() == at::ScalarType::Float &&
-      x.scalar_type() == at::ScalarType::Half) {
-    sgmv<float, half, half>((float *)y.data_ptr(), (half *)x.data_ptr(),
-                            (half **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
-                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
-                            layer_idx, stream);
-    return;
-  }
-  // The second is y = y + tmp * B.
-  if (y.scalar_type() == at::ScalarType::Half &&
-      x.scalar_type() == at::ScalarType::Float) {
-    sgmv<half, float, half>((half *)y.data_ptr(), (float *)x.data_ptr(),
-                            (half **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
-                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
-                            layer_idx, stream);
-    return;
-  }
+  // sgmv<float>((float*)y.data_ptr(), (float*)x.data_ptr(),
+  //                       (float**)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+  //                       tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+  //                       layer_idx, stream);
+  // return;
   bool ok = DISPATCH_TORCH_DTYPE(x.scalar_type(), [&] {
-    return sgmv<c_type, c_type, c_type>((c_type*)y.data_ptr(), (c_type*)x.data_ptr(),
+    return sgmv<c_type>((c_type*)y.data_ptr(), (c_type*)x.data_ptr(),
                         (c_type**)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
                         tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
                         layer_idx, stream);
   });
   TORCH_CHECK(ok, "No suitable kernel.", " dtype=", x.scalar_type());
 }
+
+void dispatch_sgmv_cutlass_offset(torch::Tensor y, torch::Tensor x,
+                           torch::Tensor w_ptr, torch::Tensor s,
+                           torch::Tensor tmp, int layer_idx, int y_offset, int y_size) {
+  CHECK_INPUT(y);
+  CHECK_INPUT(x);
+  CHECK_INPUT(w_ptr);
+  CHECK_INPUT(s);
+  CHECK_INPUT(tmp);
+
+  CHECK_DIM(2, y);
+  CHECK_DIM(2, x);
+  CHECK_DIM(1, w_ptr);
+  CHECK_DIM(1, s);
+  CHECK_DIM(1, tmp);
+
+  int num_problems = s.size(0) - 1;
+  int d_in = x.size(1);
+  int d_out = y_size;
+  CHECK_EQ(tmp.size(0), static_cast<int64_t>(sgmv_tmp_size(num_problems)));
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  // sgmv<float>((float*)y.data_ptr(), (float*)x.data_ptr(),
+  //                       (float**)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+  //                       tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+  //                       layer_idx, stream);
+  // return;
+  bool ok = DISPATCH_TORCH_DTYPE(x.scalar_type(), [&] {
+    return sgmv<c_type>((c_type*)y.data_ptr(), (c_type*)x.data_ptr(),
+                        (c_type**)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                        tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                        layer_idx, stream);
+  });
+  TORCH_CHECK(ok, "No suitable kernel.", " dtype=", x.scalar_type());
+}
+
+void dispatch_sgmv_cutlass_custom(torch::Tensor y, torch::Tensor x,
+                           torch::Tensor w_ptr, torch::Tensor s,
+                           torch::Tensor tmp, int layer_idx) {
+  CHECK_INPUT(y);
+  CHECK_INPUT(x);
+  CHECK_INPUT(w_ptr);
+  CHECK_INPUT(s);
+  CHECK_INPUT(tmp);
+
+  CHECK_DIM(2, y);
+  CHECK_DIM(2, x);
+  CHECK_DIM(1, w_ptr);
+  CHECK_DIM(1, s);
+  CHECK_DIM(1, tmp);
+
+  int num_problems = s.size(0) - 1;
+  int d_in = x.size(1);
+  int d_out = y.size(1);
+  CHECK_EQ(tmp.size(0), static_cast<int64_t>(sgmv_tmp_size(num_problems)));
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  bool ok = false;
+  // The following two special handling is for data types in vLLM.
+  // The first is tmp = tmp + x * A, and tmp is in float.
+  if (y.scalar_type() == at::ScalarType::Float &&
+      x.scalar_type() == at::ScalarType::Half) {
+    ok = sgmv_custom<float, nv_half, nv_half>((float *)y.data_ptr(), (nv_half *)x.data_ptr(),
+                            (nv_half **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                            layer_idx, stream);
+  }
+  // The second is y = y + tmp * B.
+  if (y.scalar_type() == at::ScalarType::Half &&
+      x.scalar_type() == at::ScalarType::Float) {
+    ok = sgmv_custom<nv_half, float, float>((nv_half *)y.data_ptr(), (float *)x.data_ptr(),
+                            (float **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                            layer_idx, stream);
+    return;
+  }
+  if (y.scalar_type() == at::ScalarType::Float &&
+      x.scalar_type() == at::ScalarType::BFloat16) {
+    ok = sgmv_custom<float, nv_bfloat16, nv_bfloat16>((float *)y.data_ptr(), (nv_bfloat16 *)x.data_ptr(),
+                            (nv_bfloat16 **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                            layer_idx, stream);
+  }
+  if (y.scalar_type() == at::ScalarType::BFloat16 &&
+      x.scalar_type() == at::ScalarType::Float) {
+    ok = sgmv_custom<nv_bfloat16, float, float>((nv_bfloat16 *)y.data_ptr(), (float *)x.data_ptr(),
+                            (float **)w_ptr.data_ptr(), s.data_ptr<int32_t>(),
+                            tmp.data_ptr<uint8_t>(), num_problems, d_in, d_out,
+                            layer_idx, stream);
+    return;
+  }
+  TORCH_CHECK(ok, "No suitable kernel.", " x.dtype=", x.scalar_type(), " y.dtype=", y.scalar_type());
+}
+
 
 void dispatch_sgmv_shrink(torch::Tensor y, torch::Tensor x, torch::Tensor w_ptr,
                           torch::Tensor s, torch::Tensor tmp, int layer_idx) {
