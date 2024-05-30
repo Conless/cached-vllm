@@ -88,7 +88,72 @@ def _apply_lora(
     x = x.view(-1, x.shape[-1])
     output = output.view(-1, output.shape[-1])
     indices = indices.view(-1)
+    
+    # output_std = output.clone()
+    # print(x.sum(), output.sum())
     add_lora(output, x, lora_a_stacked, lora_b_stacked, indices, 0, 1.0)
+    # print(output.sum())
+    return output
+    
+    # x = x.to(torch.float32)
+    
+    # import gc
+    # gc.disable()
+    
+    lora_a_stacked_transposed = [lora_a_stacked[i].to(dtype=x.dtype).view(-1, lora_a_stacked.shape[-1]).T.contiguous() for i in range(lora_a_stacked.shape[0])]
+    lora_b_stacked_transposed = [lora_b_stacked[i].to(dtype=x.dtype).view(-1, lora_b_stacked.shape[-1]).T.contiguous() for i in range(lora_b_stacked.shape[0])]
+    lora_a_stacked_transposed_fp32 = [lora_a_stacked[i].to(dtype=torch.float32).view(-1, lora_a_stacked.shape[-1]).T.contiguous() for i in range(lora_a_stacked.shape[0])]
+    lora_b_stacked_transposed_fp32 = [lora_b_stacked[i].to(dtype=torch.float32).view(-1, lora_b_stacked.shape[-1]).T.contiguous() for i in range(lora_b_stacked.shape[0])]
+
+
+    # x = x.to(torch.float32)
+    empty_lora_a = torch.zeros_like(lora_a_stacked_transposed[0], dtype=x.dtype, device="cuda:0")
+    empty_lora_b = torch.zeros_like(lora_b_stacked_transposed[0], dtype=x.dtype, device="cuda:0")
+    empty_lora_a_fp32 = torch.zeros_like(lora_a_stacked_transposed[0], dtype=torch.float32, device="cuda:0")
+    empty_lora_b_fp32 = torch.zeros_like(lora_b_stacked_transposed[0], dtype=torch.float32, device="cuda:0")
+    
+    wa_ptr = []
+    wb_ptr = []
+    wa_ptr_fp32 = []
+    wb_ptr_fp32 = []
+    s = []
+
+    for i in range(indices.shape[0]):
+        if i == 0 or indices[i] != indices[i - 1]:
+            if indices[i] == -1:
+                wa_ptr.append(empty_lora_a.data_ptr())
+                wb_ptr.append(empty_lora_b.data_ptr())
+                wa_ptr_fp32.append(empty_lora_a_fp32.data_ptr())
+                wb_ptr_fp32.append(empty_lora_b_fp32.data_ptr())
+            else:
+                wa_ptr.append(lora_a_stacked_transposed[indices[i]].data_ptr())
+                wb_ptr.append(lora_b_stacked_transposed[indices[i]].data_ptr())
+                wa_ptr_fp32.append(lora_a_stacked_transposed_fp32[indices[i]].data_ptr())
+                wb_ptr_fp32.append(lora_b_stacked_transposed_fp32[indices[i]].data_ptr())
+            s.append(i)
+    s.append(indices.shape[0])
+    
+    wa_ptr = torch.tensor(wa_ptr, device="cuda:0", dtype=torch.int64)
+    wb_ptr = torch.tensor(wb_ptr, device="cuda:0", dtype=torch.int64)
+    wa_ptr_fp32 = torch.tensor(wa_ptr_fp32, device="cuda:0", dtype=torch.int64)
+    wb_ptr_fp32 = torch.tensor(wb_ptr_fp32, device="cuda:0", dtype=torch.int64)
+    s = torch.tensor(s, device="cuda:0", dtype=torch.int32)
+    
+    from vllm.lora.paged.sgmv import add_lora_sgmv_cutlass, add_lora_sgmv_cutlass_custom, add_lora_sgmv_cutlass_fp32
+    # output_tmp = output.clone()
+    # output_fp32 = output.clone()
+    print(x.sum(), output.sum())
+    add_lora_sgmv_cutlass(output, x, wa_ptr, wb_ptr, s, 0, empty_lora_a.shape[-1])
+    # add_lora_sgmv_cutlass_custom(output_tmp, x, wa_ptr, wb_ptr_fp32, s, 0, empty_lora_a.shape[-1])
+    # add_lora_sgmv_cutlass_fp32(output_fp32, x, wa_ptr_fp32, wb_ptr_fp32, s, 0, empty_lora_a.shape[-1])
+    
+    print(output.sum())
+    # gc.enable()
+    # output.set_(output_fp32)
+    # if torch.isnan(output.sum()):
+        # exit(0)
+    
+    # assert torch.allclose(output, output_std, rtol=1e-2, atol=1e-3)
     return output.view_as(org_output)
 
 
@@ -124,12 +189,19 @@ def _apply_lora_packed_nslice(
     x = x.view(-1, x.shape[-1])
     output = output.view(-1, output.shape[-1])
     indices = indices.view(-1)
-    offset_left = 0
+    offset = 0
+    output_tmp = []
     for slice_idx in range(len(output_slices)):
+        # next_offset = offset + output_slices[slice_idx]
         add_lora_slice(output, x, lora_a_stacked[slice_idx],
-                       lora_b_stacked[slice_idx], indices, 0, 1.0, offset_left,
+                       lora_b_stacked[slice_idx], indices, 0, 1.0, offset,
                        output_slices[slice_idx])
-        offset_left += output_slices[slice_idx]
+        # output_tmp.append(output[:, offset:next_offset].contiguous())
+        
+        # _apply_lora(x, lora_a_stacked[slice_idx],
+                    #    lora_b_stacked[slice_idx], indices, output_tmp[slice_idx])
+        offset += output_slices[slice_idx]
+    # output.set_(torch.cat(output_tmp, dim=1))
     return output.view_as(org_output)
 
 
@@ -236,7 +308,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             (
                 max_loras,
                 lora_config.lora_extra_vocab_size,
-                self.base_layer.embedding_dim,
+                self.base_layer.embeddpunica,
             ),
             dtype=self.base_layer.weight.dtype,
             device=self.base_layer.weight.device,

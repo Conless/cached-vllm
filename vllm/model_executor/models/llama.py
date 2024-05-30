@@ -25,6 +25,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionMetadata
@@ -33,7 +34,7 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+from vllm.model_executor.layers.linear import (ColumnParallelLinear, MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -61,9 +62,14 @@ class LlamaMLP(nn.Module):
         bias: bool = False,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_proj = ColumnParallelLinear(
             input_size=hidden_size,
-            output_sizes=[intermediate_size] * 2,
+            output_size=intermediate_size,
+            bias=bias,
+            quant_config=quant_config)
+        self.up_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=intermediate_size,
             bias=bias,
             quant_config=quant_config)
         self.down_proj = RowParallelLinear(input_size=intermediate_size,
@@ -73,11 +79,13 @@ class LlamaMLP(nn.Module):
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+        # self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        gate, _ = self.gate_proj(x)
+        up, _ = self.up_proj(x)
+        # x = self.act_fn(gate_up)
+        x = F.silu(gate) * up
         x, _ = self.down_proj(x)
         return x
 
@@ -120,14 +128,36 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size=hidden_size,
-            head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
-            total_num_kv_heads=self.total_num_kv_heads,
+        # self.qkv_proj = QKVParallelLinear(
+        #     hidden_size=hidden_size,
+        #     head_size=self.head_dim,
+        #     total_num_heads=self.total_num_heads,
+        #     total_num_kv_heads=self.total_num_kv_heads,
+        #     bias=bias,
+        #     quant_config=quant_config,
+        # )
+        
+        self.q_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=self.q_size,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=quant_config
         )
+
+        self.k_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=self.kv_size,
+            bias=bias,
+            quant_config=quant_config
+        )
+
+        self.v_proj = ColumnParallelLinear(
+            input_size=hidden_size,
+            output_size=self.kv_size,
+            bias=bias,
+            quant_config=quant_config
+        )
+
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
@@ -157,8 +187,11 @@ class LlamaAttention(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # qkv, _ = self.qkv_proj(hidden_states)
+        q, _ = self.q_proj(hidden_states)
+        k, _ = self.k_proj(hidden_states)
+        v, _ = self.v_proj(hidden_states)
+        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
@@ -302,21 +335,20 @@ class LlamaModel(nn.Module):
 
 class LlamaForCausalLM(nn.Module):
     packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
+        # "qkv_proj": [
+            # "q_proj",
+            # "k_proj",
+            # "v_proj",
+        # ],
+        # "gate_up_proj": [
+        #     "gate_proj",
+        #     "up_proj",
+        # ],
     }
 
     # LoRA specific attributes
     supported_lora_modules = [
-        "qkv_proj", "o_proj", "gate_up_proj", "down_proj", "embed_tokens",
-        "lm_head"
+        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"
     ]
     embedding_modules = {
         "embed_tokens": "input_embeddings",
@@ -385,11 +417,11 @@ class LlamaForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
+            # (".qkv_proj", ".q_proj", "q"),
+            # (".qkv_proj", ".k_proj", "k"),
+            # (".qkv_proj", ".v_proj", "v"),
+            # (".gate_up_proj", ".gate_proj", 0),
+            # (".gate_up_proj", ".up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
