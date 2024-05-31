@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.models import (LoRAModel, LoRAModelManager,
                               LRUCacheLoRAModelManager, create_lora_manager)
+from vllm.lora.paged.models import LoRAPagedModel, PageCacheLoRAModelManager
 from vllm.lora.request import LoRARequest
 
 logger = init_logger(__name__)
@@ -250,6 +251,58 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             max_num_batched_tokens=self.max_num_batched_tokens,
         )
         self._lora_manager = lora_manager
+        return lora_manager.model
+
+    def _apply_loras(self, lora_requests: Set[LoRARequest]) -> None:
+        loras_map = {
+            lora_request.lora_int_id: lora_request
+            for lora_request in lora_requests if lora_request
+        }
+        if len(loras_map) > self._lora_manager.lora_slots:
+            raise RuntimeError(
+                f"Number of requested LoRAs ({len(loras_map)}) is greater "
+                "than the number of GPU LoRA slots "
+                f"({self._lora_manager.lora_slots}).")
+        for lora in loras_map.values():
+            self.add_lora(lora)
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        if lora_request.lora_int_id not in self.list_loras():
+            # Remove before we load the new lora to save memory
+            if len(self._lora_manager) + 1 > self._lora_manager.capacity:
+                assert isinstance(self._lora_manager, LRUCacheLoRAModelManager)
+                self._lora_manager.remove_oldest_lora()
+            lora = self._load_lora(lora_request)
+            loaded = self._lora_manager.add_lora(lora)
+        else:
+            # If the lora is already loaded, just touch it to
+            # update its position in the caches
+            loaded = self._lora_manager.get_lora(
+                lora_request.lora_int_id) is not None
+        self._lora_manager.activate_lora(lora_request.lora_int_id)
+        return loaded
+
+class PageCacheWorkerLoRAManager(WorkerLoRAManager):
+    """WorkerLoRAManager that manages LoRA models on the worker side.
+
+    Uses an LRU Cache with paging mechanism. """
+
+    _lora_manager_cls: Type[
+        PageCacheLoRAModelManager] = PageCacheLoRAModelManager
+
+    def create_lora_manager(
+        self,
+        model: torch.nn.Module,
+    ) -> Any:
+        lora_manager = create_lora_manager(
+            model,
+            lora_manager_cls=self._lora_manager_cls,
+            max_num_seqs=self.max_num_seqs,
+            vocab_size=self.vocab_size,
+            lora_config=self.lora_config,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+        )
+        self._lora_manager: PageCacheLoRAModelManager = lora_manager
         return lora_manager.model
 
     def _apply_loras(self, lora_requests: Set[LoRARequest]) -> None:

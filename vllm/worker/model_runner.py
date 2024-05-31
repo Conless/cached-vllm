@@ -14,8 +14,10 @@ from vllm.distributed import broadcast_tensor_dict
 from vllm.distributed.communication_op import graph_capture
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
+from vllm.lora.models import LoRAModel
+from vllm.lora.paged.models import LoRAPagedModel
 from vllm.lora.request import LoRARequest
-from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager, PageCacheWorkerLoRAManager, WorkerLoRAManager
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.model_loader import get_model
 from vllm.sampling_params import SamplingParams
@@ -127,7 +129,7 @@ class ModelRunner:
         # Set if the backend is flashinfer.
         self.flashinfer_workspace_buffer: torch.Tensor
         # Set after load_model.
-        self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
+        self.lora_manager: Optional[WorkerLoRAManager] = None
 
     def load_model(self) -> None:
         with CudaMemoryProfiler() as m:
@@ -155,17 +157,33 @@ class ModelRunner:
                 "embedding_modules"), "Model does not have embedding_modules"
             assert hasattr(self.model, "embedding_padding_modules"
                            ), "Model does not have embedding_padding_modules"
-            self.lora_manager = LRUCacheWorkerLoRAManager(
-                self.scheduler_config.max_num_seqs,
-                self.scheduler_config.max_num_batched_tokens,
-                self.vocab_size,
-                self.lora_config,
-                self.device,
-                self.model.embedding_modules,
-                self.model.embedding_padding_modules,
-                max_position_embeddings=self.model.config.
-                max_position_embeddings,
-            )
+            
+            if self.lora_config.use_page_cache:
+                self.lora_manager = PageCacheWorkerLoRAManager(
+                    self.scheduler_config.max_num_seqs,
+                    self.scheduler_config.max_num_batched_tokens,
+                    self.vocab_size,
+                    self.lora_config,
+                    self.device,
+                    self.model.embedding_modules,
+                    self.model.embedding_padding_modules,
+                    LoRAPagedModel,
+                    self.model.config.
+                    max_position_embeddings,
+                )
+            else:
+                self.lora_manager = LRUCacheWorkerLoRAManager(
+                    self.scheduler_config.max_num_seqs,
+                    self.scheduler_config.max_num_batched_tokens,
+                    self.vocab_size,
+                    self.lora_config,
+                    self.device,
+                    self.model.embedding_modules,
+                    self.model.embedding_padding_modules,
+                    LoRAModel,
+                    self.model.config.
+                    max_position_embeddings,
+                )
             self.model = self.lora_manager.create_lora_manager(self.model)
 
         if self.kv_cache_dtype == "fp8" and is_hip():
@@ -703,10 +721,15 @@ class ModelRunner:
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
+        
+        import bench_global_vars
+        bench_global_vars.set_value("start_time", time.perf_counter_ns())
         hidden_states = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
+        
+        print("Shape: ", logits.shape[0], ",", logits.shape[1])
 
         # Only perform sampling in the driver worker.
         if not self.is_driver_worker:

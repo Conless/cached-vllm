@@ -973,6 +973,11 @@ class LoRAConfig:
     lora_vocab_padding_size: ClassVar[int] = 256
     long_lora_scaling_factors: Optional[Tuple[float]] = None
 
+    # For page cache manager
+    memory_pool_size: int = 1024
+    memory_pool_page_size: int = 64
+    use_page_cache: bool = False
+
     def __post_init__(self):
         # Keep this in sync with csrc/punica/bgmv/bgmv_config.h
         possible_max_ranks = (8, 16, 32, 64)

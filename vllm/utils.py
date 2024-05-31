@@ -99,9 +99,10 @@ class LRUCache(Generic[T]):
 
     def remove_oldest(self):
         if not self.cache:
-            return
+            return None
         key, value = self.cache.popitem(last=False)
         self._on_remove(key, value)
+        return key, value
 
     def _remove_old_if_needed(self) -> None:
         while len(self.cache) > self.capacity:

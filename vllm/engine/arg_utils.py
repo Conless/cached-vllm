@@ -60,14 +60,17 @@ class EngineArgs:
     tokenizer_pool_size: int = 0
     tokenizer_pool_type: str = "ray"
     tokenizer_pool_extra_config: Optional[dict] = None
+    # LoRA related configs
     enable_lora: bool = False
     max_loras: int = 1
     max_lora_rank: int = 16
     fully_sharded_loras: bool = False
     lora_extra_vocab_size: int = 256
     long_lora_scaling_factors: Optional[Tuple[float]] = None
-    lora_dtype = 'auto'
+    lora_dtype: str = 'auto'
     max_cpu_loras: Optional[int] = None
+    use_page_cache: bool = False
+
     device: str = 'auto'
     ray_workers_use_nsight: bool = False
     num_gpu_blocks_override: Optional[int] = None
@@ -615,7 +618,9 @@ class EngineArgs:
             long_lora_scaling_factors=self.long_lora_scaling_factors,
             lora_dtype=self.lora_dtype,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
-            and self.max_cpu_loras > 0 else None) if self.enable_lora else None
+            and self.max_cpu_loras > 0 else None,
+            use_page_cache=self.use_page_cache
+        ) if self.enable_lora else None
 
         load_config = LoadConfig(
             load_format=self.load_format,
