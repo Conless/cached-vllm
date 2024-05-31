@@ -29,7 +29,7 @@ class PageCacheMemoryPool:
         else:
             raise ValueError(f"Unsupported dtype: {lora_config.lora_dtype}")
 
-        self.page_rows = self.page_size * (2**20) // self.page_width
+        self.page_rows = self.page_size * (2**20) // page_width_size
         
         print(f"Page cache init with total size: {self.max_size} MB, page size: {self.page_size} MB, each with {self.page_rows} entries")
         self.pages = [
@@ -51,6 +51,13 @@ class PageCacheMemoryPool:
             raise ValueError(f"Page {page_index} is not used by LoRA {lora_id}")
         page = self.pages[page_index]
         self.available_pages[page_index] = page
+    
+    def deactivate_lora(self, lora_id: int):
+        if lora_id not in self.used_pages:
+            raise ValueError(f"LoRA {lora_id} is not active")
+        for page_index in self.used_pages[lora_id]:
+            self.available_pages[page_index] = self.pages[page_index][1]
+        del self.used_pages[lora_id]
     
     def allocate_page(self, lora_id: int) -> tuple[int, torch.Tensor]:
         if self.available_page_count() == 0:

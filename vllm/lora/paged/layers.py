@@ -16,7 +16,7 @@ from vllm.distributed import (get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce,
                               tensor_model_parallel_gather)
 from vllm.distributed.utils import divide
-from vllm.lora.paged.sgmv import add_lora_sgmv_cutlass
+from vllm.lora.paged.sgmv import add_lora_sgmv_cutlass, add_lora_sgmv_cutlass_fp32
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
@@ -105,7 +105,8 @@ def _apply_lora(
         
     wa_ptr = torch.tensor(wa_ptr, device="cuda:0", dtype=torch.int64)
     wb_ptr = torch.tensor(wb_ptr, device="cuda:0", dtype=torch.int64)
-    add_lora_sgmv_cutlass(output, x, wa_ptr, wb_ptr, s, 0, rank)
+    s = torch.tensor(s, device="cuda:0", dtype=torch.int32)
+    add_lora_sgmv_cutlass_fp32(output, x, wa_ptr, wb_ptr, s, 0, rank)
     return output.view_as(org_output)
 
 def _apply_original_lora(
@@ -253,7 +254,7 @@ class BaseLayerWithPagedLoRA(nn.Module):
     def set_mapping(
         self,
         base_indices: torch.Tensor,
-        indices_len: int, 
+        indices_len: List[int],
     ):
         """Sets the mapping indices."""
         ...
@@ -299,7 +300,13 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
         #     dtype=lora_config.lora_dtype,
         #     device=self.device,
         # )
+        self.lora_a_empty = torch.zeros(
+            (self.input_size, lora_config.max_lora_rank),
+            dtype=lora_config.lora_dtype,
+            device=self.device,
+        )
         self.lora_a_ptr = [ None for _ in range(max_loras) ]
+        self.lora_a_ptr.append(self.lora_a_empty.data_ptr())
         # self.lora_b_stacked = torch.zeros(
         #     max_loras,
         #     1,
@@ -308,16 +315,22 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
         #     dtype=lora_config.lora_dtype,
         #     device=self.device,
         # )
+        self.lora_b_empty = torch.zeros(
+            (lora_config.max_lora_rank, self.output_size),
+            dtype=lora_config.lora_dtype,
+            device=self.device,
+        )
         self.lora_b_ptr = [ None for _ in range(max_loras) ]
+        self.lora_b_ptr.append(self.lora_b_empty.data_ptr())
         self.output_dim = self.output_size
 
         # lazily initialized.
         self.indices: torch.Tensor
-        self.indices_len: int
+        self.indices_len: List[int]
 
     def reset_lora(self, index: int):
-        self.lora_a_ptr[index] = None
-        self.lora_b_ptr[index] = None
+        self.lora_a_ptr[index] = self.lora_a_empty.data_ptr()
+        self.lora_b_ptr[index] = self.lora_b_empty.data_ptr()
 
     def slice_lora_a(self, lora_a: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -339,7 +352,7 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
     def set_mapping(
         self,
         base_indices: torch.Tensor,
-        indices_len: int
+        indices_len: List[int]
     ):
         self.indices = base_indices
         self.indices_len = indices_len
@@ -352,7 +365,7 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
             x,
             self.lora_a_ptr,
             self.lora_b_ptr,
-            self.indices[:self.indices_len],
+            self.indices[:self.indices_len[0]],
             self.lora_config.max_lora_rank,
             output,
         )
@@ -408,15 +421,30 @@ class RowParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
         self.lora_config = lora_config
         self.tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
+
+        self.lora_a_empty = torch.zeros(
+            (self.input_size, lora_config.max_lora_rank),
+            dtype=lora_config.lora_dtype,
+            device=self.device,
+        )
         self.lora_a_ptr = [ None for _ in range(max_loras) ]
+        self.lora_a_ptr.append(self.lora_a_empty.data_ptr())
+
+        self.lora_b_empty = torch.zeros(
+            (lora_config.max_lora_rank, self.output_size),
+            dtype=lora_config.lora_dtype,
+            device=self.device,
+        )
         self.lora_b_ptr = [ None for _ in range(max_loras) ]
+        self.lora_b_ptr.append(self.lora_b_empty.data_ptr())
+
         # Lazily initialized
         self.indices: torch.Tensor
-        self.indices_len: int
+        self.indices_len: List[int]
 
     def reset_lora(self, index: int):
-        self.lora_a_ptr[index] = None
-        self.lora_b_ptr[index] = None
+        self.lora_a_ptr[index] = self.lora_a_empty.data_ptr()
+        self.lora_b_ptr[index] = self.lora_b_empty.data_ptr()
 
     def slice_lora_a(self, lora_a: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -449,7 +477,7 @@ class RowParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
     def set_mapping(
         self,
         base_indices: torch.Tensor,
-        indices_len: int
+        indices_len: List[int]
     ):
         self.indices = base_indices
         self.indices_len = indices_len
@@ -460,7 +488,7 @@ class RowParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
             x,
             self.lora_a_ptr,
             self.lora_b_ptr,
-            self.indices[:self.indices_len],
+            self.indices[:self.indices_len[0]],
             self.lora_config.max_lora_rank,
             output,
         )
