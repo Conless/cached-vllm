@@ -1,10 +1,11 @@
 import copy
 import json
 import math
+import bench_global_vars
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Callable, Dict, List, Optional, Tuple, Type, Union, Set
 
 import safetensors.torch
 import torch
@@ -72,14 +73,20 @@ def convert_mapping(
                 exist, it only contains first 4 entries.
     """
     indices = mapping.index_mapping
-    request_indices = []
+    token_indices = []
+    lora_indices = []
     for i in range(len(indices)):
         if i == 0 or indices[i] != indices[i - 1]:
             lora_idx = lora_id_to_index[indices[i]] if indices[i] > 0 else -1
-            request_indices.append((i, lora_idx))
-    request_indices.append((len(indices), -1))
-    request_indices = torch.tensor(request_indices, dtype=torch.int32, device="cuda")
-    return request_indices
+            token_indices.append(i)
+            lora_indices.append(lora_idx)
+    token_indices.append(len(indices))
+    lora_indices.append(-1)
+    token_indices = torch.tensor(token_indices, dtype=torch.int32, device="cuda:0")
+    lora_indices = torch.tensor(lora_indices, dtype=torch.int32, device="cuda:0")
+    lora_total_count = bench_global_vars.get_value("lora_total_count")
+    bench_global_vars.set_value("lora_total_count", lora_total_count + 1)
+    return token_indices, lora_indices
 
 
 def get_lora_id():
@@ -123,7 +130,7 @@ class LoRAPagedModel(LoRAModel):
 
     def profile(self, pool: PageCacheMemoryPool) -> int:
         """Profile the paged memory usage of the LoRAModel."""
-        self.pages = 0
+        self.pages = 1
         current_page_row_index = 0
         for lora in self.loras.values():
             if lora.rank < pool.max_rank:  # Align to max rank
@@ -232,10 +239,6 @@ class PageCacheLoRAModelManager(LoRAModelManager):
         self.max_num_batched_tokens = math.ceil(max_num_batched_tokens / 8) * 8
         self.lora_index_to_id: List[Optional[int]] = [None] * self.lora_slots
         self.lora_id_to_index: Dict[int, int] = {}
-        self.base_indices: torch.Tensor = torch.zeros(
-            (max_num_seqs + 1, 2), dtype=torch.int32, device="cuda"
-        )
-        self.indices_len: List[int] = [0]
 
         self.model: nn.Module = model
         if hasattr(self.model, "supported_lora_modules"):
@@ -265,7 +268,7 @@ class PageCacheLoRAModelManager(LoRAModelManager):
         if not lora_model:
             return False
         while (
-            lora_model.pages >= self.memory_pool.available_page_count()
+            lora_model.pages > self.memory_pool.available_page_count()
             or len(self._active_loras) >= self.lora_slots
         ):
             self._active_loras.remove_oldest()
@@ -334,11 +337,11 @@ class PageCacheLoRAModelManager(LoRAModelManager):
         return bool(self._registered_loras.pop(lora_id, None))
 
     def _set_lora_mapping(self, mapping: LoRAMapping) -> None:
-        base_indices = convert_mapping(
+        token_indices, lora_indices = convert_mapping(
             mapping, self.lora_index_to_id, self.lora_id_to_index, self.lora_slots + 1
         )
-        self.base_indices[: base_indices.shape[0]].copy_(base_indices)
-        self.indices_len[0] = base_indices.shape[0]
+        for module in self.modules.values():
+            module.set_mapping(token_indices, lora_indices)
 
     def set_lora_mapping(self, lora_mapping: LoRAMapping) -> None:
         if self._last_mapping != lora_mapping:
@@ -369,7 +372,6 @@ class PageCacheLoRAModelManager(LoRAModelManager):
                 ),
             )
             self.register_module(module_name, new_module)
-            new_module.set_mapping(self.base_indices, self.indices_len)
         # logger.info("Loading module" + module_name + "took %.4f MB, used %.4f GB in total.", m.consumed_memory / float(2 ** 20), m.current_memory_usage() / float(2 ** 30))
 
     def register_module(self, module_name: str, module: "BaseLayerWithPagedLoRA"):

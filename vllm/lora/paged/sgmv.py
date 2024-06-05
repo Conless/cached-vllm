@@ -107,7 +107,7 @@ def add_lora_sgmv_cutlass_fp32(
     y_tmp = y.clone().to(torch.float32)
     punica_kernels.sgmv_cutlass(y_tmp, v, wb_ptr, s, tmp, layer_idx)
     y.set_(y_tmp.to(y.dtype))
-    return v.to(x.dtype), y
+    return v, y
 
 def add_lora_sgmv_cutlass_custom(
     y: torch.Tensor,

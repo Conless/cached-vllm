@@ -70,6 +70,8 @@ class EngineArgs:
     lora_dtype: str = 'auto'
     max_cpu_loras: Optional[int] = None
     use_page_cache: bool = False
+    memory_pool_size: int = 1024
+    memory_pool_page_size: int = 64
 
     device: str = 'auto'
     ray_workers_use_nsight: bool = False
@@ -619,7 +621,9 @@ class EngineArgs:
             lora_dtype=self.lora_dtype,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None,
-            use_page_cache=self.use_page_cache
+            use_page_cache=self.use_page_cache,
+            memory_pool_size=self.memory_pool_size,
+            memory_pool_page_size=self.memory_pool_page_size
         ) if self.enable_lora else None
 
         load_config = LoadConfig(

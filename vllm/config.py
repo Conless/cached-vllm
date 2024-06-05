@@ -974,9 +974,9 @@ class LoRAConfig:
     long_lora_scaling_factors: Optional[Tuple[float]] = None
 
     # For page cache manager
+    use_page_cache: bool = False
     memory_pool_size: int = 1024
     memory_pool_page_size: int = 64
-    use_page_cache: bool = False
 
     def __post_init__(self):
         # Keep this in sync with csrc/punica/bgmv/bgmv_config.h
