@@ -689,6 +689,12 @@ class LLMEngine:
             output, scheduler_outputs.scheduled_seq_groups,
             scheduler_outputs.ignored_seq_groups, seq_group_metadata_list)
 
+        import bench_global_vars
+        total_time = bench_global_vars.get_value("total_time")
+        start_time = bench_global_vars.get_value("start_time")
+        total_time += time.perf_counter_ns() - start_time
+        bench_global_vars.set_value("total_time", total_time)
+
         # Log stats.
         self.do_log_stats(scheduler_outputs, output)
 

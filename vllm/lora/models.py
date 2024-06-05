@@ -18,7 +18,7 @@ from vllm.lora.layers import (BaseLayerWithLoRA,
 from vllm.lora.lora import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.utils import (from_layer, from_layer_logits_processor,
                              parse_fine_tuned_lora_name, replace_submodule)
-from vllm.utils import LRUCache, is_pin_memory_available
+from vllm.utils import CudaMemoryProfiler, LRUCache, is_pin_memory_available
 
 logger = init_logger(__name__)
 
@@ -567,39 +567,41 @@ class LoRAModelManager:
         self._active_loras.clear()
 
     def _create_lora_modules(self):
-        for module_name, module in self.model.named_modules(
-                remove_duplicate=False):
-            if not self._match_target_modules(module_name):
-                continue
-            parts = module_name.split(".")[-1]
-            packed_moduled_lst = self.packed_modules_mapping.get(parts, [])
-            new_module = replace_submodule(
-                self.model, module_name,
-                from_layer(module, self.lora_slots, self.lora_config,
-                           packed_moduled_lst, self.model.config))
-            # LinearScalingRotaryEmbeddingWithLora is used to handle
-            # long context lora. Register relevant metadata.
-            if isinstance(new_module, LinearScalingRotaryEmbeddingWithLora):
-                self.long_lora_context = LongContextLoRAContext(
-                    new_module.scaling_factors, new_module.rotary_dim)
-                self.scaling_factor_to_offset = \
-                    new_module.scaling_factor_to_offset
-            # (yard1): TODO make this more robust
-            if "lm_head" in module_name:
-                logits_processor_module = self.model.get_submodule(
-                    "logits_processor")
+        with CudaMemoryProfiler() as m:
+            for module_name, module in self.model.named_modules(
+                    remove_duplicate=False):
+                if not self._match_target_modules(module_name):
+                    continue
+                parts = module_name.split(".")[-1]
+                packed_moduled_lst = self.packed_modules_mapping.get(parts, [])
                 new_module = replace_submodule(
-                    self.model, "logits_processor",
-                    from_layer_logits_processor(logits_processor_module,
-                                                module, self.lora_slots,
-                                                self.lora_config,
-                                                self.model.config))
-            self.register_module(module_name, new_module)
-            self._register_packed_modules(module_name)
-            new_module.set_mapping(self.base_indices, self.sampler_indices,
-                                   self.sampler_indices_padded,
-                                   self.embeddings_indices,
-                                   self.long_lora_indices, self.indices_len)
+                    self.model, module_name,
+                    from_layer(module, self.lora_slots, self.lora_config,
+                            packed_moduled_lst, self.model.config))
+                # LinearScalingRotaryEmbeddingWithLora is used to handle
+                # long context lora. Register relevant metadata.
+                if isinstance(new_module, LinearScalingRotaryEmbeddingWithLora):
+                    self.long_lora_context = LongContextLoRAContext(
+                        new_module.scaling_factors, new_module.rotary_dim)
+                    self.scaling_factor_to_offset = \
+                        new_module.scaling_factor_to_offset
+                # (yard1): TODO make this more robust
+                if "lm_head" in module_name:
+                    logits_processor_module = self.model.get_submodule(
+                        "logits_processor")
+                    new_module = replace_submodule(
+                        self.model, "logits_processor",
+                        from_layer_logits_processor(logits_processor_module,
+                                                    module, self.lora_slots,
+                                                    self.lora_config,
+                                                    self.model.config))
+                self.register_module(module_name, new_module)
+                self._register_packed_modules(module_name)
+                new_module.set_mapping(self.base_indices, self.sampler_indices,
+                                    self.sampler_indices_padded,
+                                    self.embeddings_indices,
+                                    self.long_lora_indices, self.indices_len)
+        logger.info("Memory usage: %s GB", m.consumed_memory / 1024**3)
 
     def register_module(self, module_name: str, module: "BaseLayerWithLoRA"):
         assert isinstance(module, BaseLayerWithLoRA)

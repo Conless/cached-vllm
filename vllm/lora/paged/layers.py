@@ -1,6 +1,8 @@
 # pylint: disable=unused-argument
 import math
 from dataclasses import dataclass
+import time
+import bench_global_vars
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -64,8 +66,8 @@ def _not_fully_sharded_can_replace(can_replace):
 
 def _apply_lora(
     x: torch.Tensor,
-    lora_a_ptr: torch.Tensor,
-    lora_b_ptr: torch.Tensor,
+    wa_ptr: torch.Tensor,
+    wb_ptr: torch.Tensor,
     indices: torch.Tensor,
     rank: int,
     output: torch.Tensor,
@@ -76,10 +78,10 @@ def _apply_lora(
 
     Input shapes:
         x:               (batch_size, hidden_dim)
-        lora_a_ptr:      (max_loras, )
+        wa_ptr:          (num_lora_seqs, )
             DType: torch.int64
             The matrix it points to has shape (input_dim, lora_rank)
-        lora_b_ptr:      (max_loras, )
+        wb_ptr:          (num_lora_seqs, )
             DType: torch.int64
             The matrix it points to has shape (lora_rank, output_dim)
         indices:         (num_lora_seqs + 1, )
@@ -88,25 +90,12 @@ def _apply_lora(
     org_output = output
     x = x.view(-1, x.shape[-1])
     output = output.view(-1, output.shape[-1])
-    wa_ptr = [None for _ in range(indices.size(0) - 1)]
-    wb_ptr = [None for _ in range(indices.size(0) - 1)]
-    s = [0 for _ in range(indices.size(0))]
-
-    # TODO: Parallelize this loop
-    for i in range(indices.size(0) - 1):
-        start_idx, lora_idx = indices[i]
-        end_idx = indices[i + 1][0]
-        assert start_idx < end_idx, f"Start index {start_idx} is greater than end index {end_idx}"
-        assert lora_a_ptr[lora_idx] is not None, f"lora_a_ptr[{lora_idx}] is None"
-        assert lora_b_ptr[lora_idx] is not None, f"lora_b_ptr[{lora_idx}] is None"
-        wa_ptr[i] = lora_a_ptr[lora_idx]
-        wb_ptr[i] = lora_b_ptr[lora_idx]
-        s[i + 1] = end_idx
-        
-    wa_ptr = torch.tensor(wa_ptr, device="cuda:0", dtype=torch.int64)
-    wb_ptr = torch.tensor(wb_ptr, device="cuda:0", dtype=torch.int64)
-    s = torch.tensor(s, device="cuda:0", dtype=torch.int32)
-    add_lora_sgmv_cutlass_fp32(output, x, wa_ptr, wb_ptr, s, 0, rank)
+    # bench_global_vars.set_value("lora_start_time", time.perf_counter_ns())
+    add_lora_sgmv_cutlass(output, x, wa_ptr, wb_ptr, indices, 0, rank)
+    
+    # current_total_time = bench_global_vars.get_value("lora_total_time")
+    # current_total_time += time.perf_counter_ns() - bench_global_vars.get_value("lora_start_time")
+    # bench_global_vars.set_value("lora_total_time", current_total_time)
     return output.view_as(org_output)
 
 def _apply_original_lora(
@@ -305,8 +294,7 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
             dtype=lora_config.lora_dtype,
             device=self.device,
         )
-        self.lora_a_ptr = [ None for _ in range(max_loras) ]
-        self.lora_a_ptr.append(self.lora_a_empty.data_ptr())
+        self.lora_a_ptr = [self.lora_a_empty.data_ptr() for _ in range(max_loras + 1) ]
         # self.lora_b_stacked = torch.zeros(
         #     max_loras,
         #     1,
@@ -320,8 +308,7 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
             dtype=lora_config.lora_dtype,
             device=self.device,
         )
-        self.lora_b_ptr = [ None for _ in range(max_loras) ]
-        self.lora_b_ptr.append(self.lora_b_empty.data_ptr())
+        self.lora_b_ptr = [self.lora_b_empty.data_ptr() for _ in range(max_loras + 1) ]
         self.output_dim = self.output_size
 
         # lazily initialized.
@@ -351,11 +338,12 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
 
     def set_mapping(
         self,
-        base_indices: torch.Tensor,
-        indices_len: List[int]
+        token_indices: torch.Tensor,
+        lora_indices: torch.Tensor,
     ):
-        self.indices = base_indices
-        self.indices_len = indices_len
+        self.wa_ptr = torch.tensor([self.lora_a_ptr[lora_idx] for lora_idx in lora_indices[:-1]], device="cuda:0", dtype=torch.int64)
+        self.wb_ptr = torch.tensor([self.lora_b_ptr[lora_idx] for lora_idx in lora_indices[:-1]], device="cuda:0", dtype=torch.int64)
+        self.indices = token_indices
 
     def apply(self, x: torch.Tensor,
               bias: Optional[torch.Tensor]) -> torch.Tensor:
@@ -363,9 +351,9 @@ class ColumnParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
         assert self.indices is not None, "Indices not set."
         _apply_lora(
             x,
-            self.lora_a_ptr,
-            self.lora_b_ptr,
-            self.indices[:self.indices_len[0]],
+            self.wa_ptr,
+            self.wb_ptr,
+            self.indices,
             self.lora_config.max_lora_rank,
             output,
         )
@@ -427,16 +415,14 @@ class RowParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
             dtype=lora_config.lora_dtype,
             device=self.device,
         )
-        self.lora_a_ptr = [ None for _ in range(max_loras) ]
-        self.lora_a_ptr.append(self.lora_a_empty.data_ptr())
+        self.lora_a_ptr = [self.lora_a_empty.data_ptr() for _ in range(max_loras + 1)]
 
         self.lora_b_empty = torch.zeros(
             (lora_config.max_lora_rank, self.output_size),
             dtype=lora_config.lora_dtype,
             device=self.device,
         )
-        self.lora_b_ptr = [ None for _ in range(max_loras) ]
-        self.lora_b_ptr.append(self.lora_b_empty.data_ptr())
+        self.lora_b_ptr = [self.lora_b_empty.data_ptr() for _ in range(max_loras + 1)]
 
         # Lazily initialized
         self.indices: torch.Tensor
@@ -476,19 +462,20 @@ class RowParallelLinearWithPagedLoRA(BaseLayerWithPagedLoRA):
 
     def set_mapping(
         self,
-        base_indices: torch.Tensor,
-        indices_len: List[int]
+        token_indices: torch.Tensor,
+        lora_indices: torch.Tensor,
     ):
-        self.indices = base_indices
-        self.indices_len = indices_len
+        self.wa_ptr = torch.tensor([self.lora_a_ptr[lora_idx] for lora_idx in lora_indices[:-1]], device="cuda:0", dtype=torch.int64)
+        self.wb_ptr = torch.tensor([self.lora_b_ptr[lora_idx] for lora_idx in lora_indices[:-1]], device="cuda:0", dtype=torch.int64)
+        self.indices = token_indices
 
     def apply(self, x: torch.Tensor) -> torch.Tensor:
         output = self.base_layer.quant_method.apply(self.base_layer, x)
         _apply_lora(
             x,
-            self.lora_a_ptr,
-            self.lora_b_ptr,
-            self.indices[:self.indices_len[0]],
+            self.wa_ptr,
+            self.wb_ptr,
+            self.indices,
             self.lora_config.max_lora_rank,
             output,
         )

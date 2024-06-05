@@ -1,6 +1,8 @@
 # pylint: disable=unused-argument
 import math
+import bench_global_vars
 from dataclasses import dataclass
+import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -62,6 +64,7 @@ def _not_fully_sharded_can_replace(can_replace):
     return dec
 
 
+@torch.inference_mode()
 def _apply_lora(
     x: torch.Tensor,
     lora_a_stacked: torch.Tensor,
@@ -84,14 +87,15 @@ def _apply_lora(
         indices:         (batch_size)
         output:          (batch_size, output_dim)
     """
+    bench_global_vars.set_value("lora_start_time", time.perf_counter_ns())
     org_output = output
     x = x.view(-1, x.shape[-1])
     output = output.view(-1, output.shape[-1])
     indices = indices.view(-1)
     
-    # output_std = output.clone()
+    # output_fp32 = output.clone()
     # print(x.sum(), output.sum())
-    add_lora(output, x, lora_a_stacked, lora_b_stacked, indices, 0, 1.0)
+    v, _ = add_lora(output, x, lora_a_stacked, lora_b_stacked, indices, 0, 1.0)
     # print(output.sum())
     return output
     
@@ -104,7 +108,6 @@ def _apply_lora(
     lora_b_stacked_transposed = [lora_b_stacked[i].to(dtype=x.dtype).view(-1, lora_b_stacked.shape[-1]).T.contiguous() for i in range(lora_b_stacked.shape[0])]
     lora_a_stacked_transposed_fp32 = [lora_a_stacked[i].to(dtype=torch.float32).view(-1, lora_a_stacked.shape[-1]).T.contiguous() for i in range(lora_a_stacked.shape[0])]
     lora_b_stacked_transposed_fp32 = [lora_b_stacked[i].to(dtype=torch.float32).view(-1, lora_b_stacked.shape[-1]).T.contiguous() for i in range(lora_b_stacked.shape[0])]
-
 
     # x = x.to(torch.float32)
     empty_lora_a = torch.zeros_like(lora_a_stacked_transposed[0], dtype=x.dtype, device="cuda:0")
@@ -133,6 +136,10 @@ def _apply_lora(
             s.append(i)
     s.append(indices.shape[0])
     
+    current_total_time = bench_global_vars.get_value("lora_total_time")
+    current_total_time += time.perf_counter_ns() - bench_global_vars.get_value("lora_start_time")
+    bench_global_vars.set_value("lora_total_time", current_total_time)
+
     wa_ptr = torch.tensor(wa_ptr, device="cuda:0", dtype=torch.int64)
     wb_ptr = torch.tensor(wb_ptr, device="cuda:0", dtype=torch.int64)
     wa_ptr_fp32 = torch.tensor(wa_ptr_fp32, device="cuda:0", dtype=torch.int64)
@@ -141,19 +148,21 @@ def _apply_lora(
     
     from vllm.lora.paged.sgmv import add_lora_sgmv_cutlass, add_lora_sgmv_cutlass_custom, add_lora_sgmv_cutlass_fp32
     # output_tmp = output.clone()
-    # output_fp32 = output.clone()
-    print(x.sum(), output.sum())
-    add_lora_sgmv_cutlass(output, x, wa_ptr, wb_ptr, s, 0, empty_lora_a.shape[-1])
-    # add_lora_sgmv_cutlass_custom(output_tmp, x, wa_ptr, wb_ptr_fp32, s, 0, empty_lora_a.shape[-1])
-    # add_lora_sgmv_cutlass_fp32(output_fp32, x, wa_ptr_fp32, wb_ptr_fp32, s, 0, empty_lora_a.shape[-1])
+    # print(output.sum(), x.sum())
+    # add_lora_sgmv_cutlass(output, x, wa_ptr, wb_ptr, s, 0, empty_lora_a.shape[-1])
+    # 25.93, 25.72
+    # add_lora_sgmv_cutlass_custom(output, x, wa_ptr, wb_ptr_fp32, s, 0, empty_lora_a.shape[-1])
+    v_fp32, _ = add_lora_sgmv_cutlass_fp32(output_fp32, x, wa_ptr_fp32, wb_ptr_fp32, s, 0, empty_lora_a.shape[-1])
+    # time.sleep(1)
     
-    print(output.sum())
+    print(v.sum(), v_fp32.sum())
+    print(output.sum(), output_fp32.sum())
     # gc.enable()
     # output.set_(output_fp32)
     # if torch.isnan(output.sum()):
         # exit(0)
     
-    # assert torch.allclose(output, output_std, rtol=1e-2, atol=1e-3)
+    # assert torch.allclose(v, v_fp32, rtol=10, atol=1)
     return output.view_as(org_output)
 
 
@@ -165,6 +174,7 @@ def _apply_lora_packed_nslice(
     output: torch.Tensor,
     output_slices: Tuple[int, ...],
 ):
+    raise "What the fuck?"
     """Applies lora to each input.
 
     This method applies all loras to each input. It uses the

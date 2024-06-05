@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod, abstractproperty
 from contextlib import contextmanager
+import time
+import bench_global_vars
 from typing import Any, Dict, List, Literal, Optional, Set, Type, Union
 
 import torch
@@ -135,8 +137,12 @@ class WorkerLoRAManager(AbstractWorkerLoRAManager):
 
     def set_active_loras(self, lora_requests: Set[LoRARequest],
                          lora_mapping: LoRAMapping) -> None:
+        lora_swap_start_time = time.perf_counter_ns()
         self._apply_loras(lora_requests)
         self._lora_manager.set_lora_mapping(lora_mapping)
+        lora_swap_time = bench_global_vars.get_value("lora_swap_time")
+        lora_swap_time += time.perf_counter_ns() - lora_swap_start_time
+        bench_global_vars.set_value("lora_swap_time", lora_swap_time)
 
     def _apply_loras(self, lora_requests: Set[LoRARequest]) -> None:
         loras_that_exist = self.list_loras()
@@ -322,7 +328,7 @@ class PageCacheWorkerLoRAManager(WorkerLoRAManager):
         if lora_request.lora_int_id not in self.list_loras():
             # Remove before we load the new lora to save memory
             if len(self._lora_manager) + 1 > self._lora_manager.capacity:
-                assert isinstance(self._lora_manager, LRUCacheLoRAModelManager)
+                assert isinstance(self._lora_manager, PageCacheLoRAModelManager)
                 self._lora_manager.remove_oldest_lora()
             lora = self._load_lora(lora_request)
             loaded = self._lora_manager.add_lora(lora)

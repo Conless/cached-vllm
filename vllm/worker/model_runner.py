@@ -1,5 +1,6 @@
 import time
 import warnings
+import bench_global_vars
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -722,7 +723,6 @@ class ModelRunner:
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         
-        import bench_global_vars
         bench_global_vars.set_value("start_time", time.perf_counter_ns())
         hidden_states = model_executable(**execute_model_kwargs)
 
@@ -755,7 +755,7 @@ class ModelRunner:
         # passed in, which contains a lora from the lora warmup path.
         dummy_lora_requests = []
         dummy_lora_requests_per_seq = []
-        if self.lora_config:
+        if self.lora_config and not self.lora_config.use_page_cache:
             assert self.lora_manager is not None
             with self.lora_manager.dummy_lora_cache():
                 for idx in range(self.lora_config.max_loras):
